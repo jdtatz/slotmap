@@ -12,10 +12,11 @@ use std::ops::{Index, IndexMut};
 
 use super::{Key, KeyData};
 use crate::util::{is_older_version, UnwrapUnchecked};
+use crate::{KeyVersion, NonZero, UInt};
 
 #[derive(Debug, Clone)]
-struct Slot<T> {
-    version: u32,
+struct Slot<T, V: KeyVersion> {
+    version: V,
     value: T,
 }
 
@@ -69,7 +70,7 @@ struct Slot<T> {
 
 #[derive(Debug, Clone)]
 pub struct SparseSecondaryMap<K: Key, V, S: hash::BuildHasher = hash_map::RandomState> {
-    slots: HashMap<u32, Slot<V>, S>,
+    slots: HashMap<<K as Key>::Index, Slot<V, K::Version>, S>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -559,7 +560,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
                     // invalid, since keys always have an odd version. This
                     // gives us a linear time disjointness check.
                     ptrs[i] = MaybeUninit::new(&mut *value);
-                    *version ^= 1;
+                    *version ^= UInt::ONE;
                 },
 
                 _ => break,
@@ -572,7 +573,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
         for k in &keys[0..i] {
             match self.slots.get_mut(&k.data().idx) {
                 Some(Slot { version, .. }) => {
-                    *version ^= 1;
+                    *version ^= UInt::ONE;
                 },
                 _ => unsafe { core::hint::unreachable_unchecked() },
             }
@@ -861,7 +862,7 @@ where
         }
 
         self.iter()
-            .all(|(key, value)| other.get(key).map_or(false, |other_value| *value == *other_value))
+        .all(|(key, value)| other.get(key).map_or(false, |other_value| *value == *other_value))
     }
 }
 
@@ -916,8 +917,8 @@ where
 /// [`Entry`] enum.
 #[derive(Debug)]
 pub struct OccupiedEntry<'a, K: Key, V> {
-    inner: hash_map::OccupiedEntry<'a, u32, Slot<V>>,
-    kd: KeyData,
+    inner: hash_map::OccupiedEntry<'a, <K as Key>::Index, Slot<V, K::Version>>,
+    kd: KeyData<K::Index, K::Version>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -925,8 +926,8 @@ pub struct OccupiedEntry<'a, K: Key, V> {
 /// [`Entry`] enum.
 #[derive(Debug)]
 pub struct VacantEntry<'a, K: Key, V> {
-    inner: hash_map::VacantEntry<'a, u32, Slot<V>>,
-    kd: KeyData,
+    inner: hash_map::VacantEntry<'a, <K as Key>::Index, Slot<V, K::Version>>,
+    kd: KeyData<K::Index, K::Version>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1281,7 +1282,7 @@ impl<'a, K: Key, V> VacantEntry<'a, K, V> {
 /// This iterator is created by [`SparseSecondaryMap::drain`].
 #[derive(Debug)]
 pub struct Drain<'a, K: Key + 'a, V: 'a> {
-    inner: hash_map::Drain<'a, u32, Slot<V>>,
+    inner: hash_map::Drain<'a, <K as Key>::Index, Slot<V, K::Version>>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1291,7 +1292,7 @@ pub struct Drain<'a, K: Key + 'a, V: 'a> {
 /// provided by the [`IntoIterator`] trait.
 #[derive(Debug)]
 pub struct IntoIter<K: Key, V> {
-    inner: hash_map::IntoIter<u32, Slot<V>>,
+    inner: hash_map::IntoIter<<K as Key>::Index, Slot<V, K::Version>>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1300,7 +1301,7 @@ pub struct IntoIter<K: Key, V> {
 /// This iterator is created by [`SparseSecondaryMap::iter`].
 #[derive(Debug)]
 pub struct Iter<'a, K: Key + 'a, V: 'a> {
-    inner: hash_map::Iter<'a, u32, Slot<V>>,
+    inner: hash_map::Iter<'a, <K as Key>::Index, Slot<V, K::Version>>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1318,7 +1319,7 @@ impl<'a, K: 'a + Key, V: 'a> Clone for Iter<'a, K, V> {
 /// This iterator is created by [`SparseSecondaryMap::iter_mut`].
 #[derive(Debug)]
 pub struct IterMut<'a, K: Key + 'a, V: 'a> {
-    inner: hash_map::IterMut<'a, u32, Slot<V>>,
+    inner: hash_map::IterMut<'a, <K as Key>::Index, Slot<V, K::Version>>,
     _k: PhantomData<fn(K) -> K>,
 }
 

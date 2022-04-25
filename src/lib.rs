@@ -1,6 +1,5 @@
 #![doc(html_root_url = "https://docs.rs/slotmap/1.0.6")]
 #![crate_name = "slotmap"]
-#![cfg_attr(all(nightly, feature = "unstable"), feature(try_reserve))]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 #![cfg_attr(all(nightly, doc), feature(doc_cfg))]
 #![warn(
@@ -223,7 +222,7 @@ pub mod sparse_secondary;
 pub(crate) mod util;
 
 use core::fmt::{self, Debug, Formatter};
-use core::num::NonZeroU32;
+use std::convert::TryInto;
 
 #[doc(inline)]
 pub use crate::basic::SlotMap;
@@ -256,30 +255,32 @@ impl<T> Slottable for T {}
 /// [`BTreeMap`](std::collections::BTreeMap), but the order of keys is
 /// unspecified.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct KeyData {
-    idx: u32,
-    version: NonZeroU32,
+pub struct KeyData<I: KeyIndex, V: KeyVersion> {
+    idx: I,
+    version: V::NonZero,
 }
 
-impl KeyData {
-    fn new(idx: u32, version: u32) -> Self {
-        debug_assert!(version > 0);
+impl<I: KeyIndex, V: KeyVersion> KeyData<I, V> {
+    fn new(idx: I, version: V) -> Self {
+        debug_assert!(version > V::ZERO);
 
         Self {
             idx,
-            version: unsafe { NonZeroU32::new_unchecked(version | 1) },
+            version: V::new_or_1(version),
         }
     }
 
     fn null() -> Self {
-        Self::new(core::u32::MAX, 1)
+        Self::new(I::MAX, V::ONE)
     }
 
     fn is_null(self) -> bool {
-        self.idx == core::u32::MAX
+        self.idx == I::MAX
     }
+}
 
-    /// Returns the key data as a 64-bit integer. No guarantees about its value
+impl<T: PackableUInt + KeyIndex + KeyVersion> KeyData<T, T> {
+    /// Returns the key data as a packed integer. No guarantees about its value
     /// are made other than that passing it to [`from_ffi`](Self::from_ffi)
     /// will return a key equal to the original.
     ///
@@ -293,26 +294,27 @@ impl KeyData {
     /// function.
     ///
     /// [`serde`]: crate#serialization-through-serde-no_std-support-and-unstable-features
-    pub fn as_ffi(self) -> u64 {
-        (u64::from(self.version.get()) << 32) | u64::from(self.idx)
+    pub fn as_ffi(self) -> T::PackedUInt {
+        self.version.get().pack(self.idx)
     }
 
     /// Iff `value` is a value received from `k.as_ffi()`, returns a key equal
     /// to `k`. Otherwise the behavior is safe but unspecified.
-    pub fn from_ffi(value: u64) -> Self {
-        let idx = value & 0xffff_ffff;
-        let version = (value >> 32) | 1; // Ensure version is odd.
-        Self::new(idx as u32, version as u32)
+    pub fn from_ffi(value: T::PackedUInt) -> Self {
+        let [upper, lower] = T::unpack(value);
+        let idx = upper;
+        let version = lower | T::ONE; // Ensure version is odd.
+        Self::new(idx, version)
     }
 }
 
-impl Debug for KeyData {
+impl<I: KeyIndex, V: KeyVersion> Debug for KeyData<I, V> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}v{}", self.idx, self.version.get())
     }
 }
 
-impl Default for KeyData {
+impl<I: KeyIndex, V: KeyVersion> Default for KeyData<I, V> {
     fn default() -> Self {
         Self::null()
     }
@@ -333,7 +335,7 @@ impl Default for KeyData {
 /// implement. It is strongly suggested to simply use [`new_key_type!`] instead
 /// of implementing this trait yourself.
 pub unsafe trait Key:
-    From<KeyData>
+    From<KeyData<Self::Index, Self::Version>>
     + Copy
     + Clone
     + Default
@@ -344,6 +346,11 @@ pub unsafe trait Key:
     + core::hash::Hash
     + core::fmt::Debug
 {
+    /// Index type
+    type Index: KeyIndex;
+    /// Version type
+    type Version: KeyVersion;
+
     /// Creates a new key that is always invalid and distinct from any non-null
     /// key. A null key can only be created through this method (or default
     /// initialization of keys made with [`new_key_type!`], which calls this
@@ -396,8 +403,198 @@ pub unsafe trait Key:
     /// let mk = MyKey::null();
     /// assert_eq!(dk.data(), mk.data());
     /// ```
-    fn data(&self) -> KeyData;
+    fn data(&self) -> KeyData<Self::Index, Self::Version>;
 }
+
+// All the ops needed for implementing.
+#[doc(hidden)]
+pub trait NonZero:
+    Sized + Copy + Clone + core::fmt::Debug + core::fmt::Display + PartialEq
+{
+    type Primitive;
+    unsafe fn new_unchecked(n: Self::Primitive) -> Self;
+    fn new(n: Self::Primitive) -> Option<Self>;
+    fn get(self) -> Self::Primitive;
+}
+
+#[doc(hidden)]
+pub trait NonZeroable: Sized {
+    type NonZero: NonZero<Primitive = Self>;
+    unsafe fn as_nonzero_unchecked(self) -> Self::NonZero {
+        Self::NonZero::new_unchecked(self)
+    }
+    fn as_nonzero(self) -> Option<Self::NonZero> {
+        Self::NonZero::new(self)
+    }
+}
+
+macro_rules! _impl_nonzero_helper {
+    ($uint:ty, $nonzero:ty) => {
+        impl NonZero for $nonzero {
+            type Primitive = $uint;
+            unsafe fn new_unchecked(n: Self::Primitive) -> Self {
+                <$nonzero>::new_unchecked(n)
+            }
+
+            fn new(n: Self::Primitive) -> Option<Self> {
+                <$nonzero>::new(n)
+            }
+
+            fn get(self) -> Self::Primitive {
+                self.get()
+            }
+        }
+
+        impl NonZeroable for $uint {
+            type NonZero = $nonzero;
+        }
+    };
+}
+
+_impl_nonzero_helper! { u8, core::num::NonZeroU8 }
+_impl_nonzero_helper! { u16, core::num::NonZeroU16 }
+_impl_nonzero_helper! { u32, core::num::NonZeroU32 }
+_impl_nonzero_helper! { u64, core::num::NonZeroU64 }
+_impl_nonzero_helper! { u128, core::num::NonZeroU128 }
+_impl_nonzero_helper! { usize, core::num::NonZeroUsize }
+
+#[doc(hidden)]
+pub trait UInt:
+    'static
+    + Copy
+    + Clone
+    + core::fmt::Debug
+    + core::fmt::Display
+    + core::hash::Hash
+    + PartialEq
+    + Eq
+    + PartialOrd
+    + Ord
+    + core::ops::Add<Output = Self>
+    + core::ops::AddAssign
+    + core::ops::Sub<Output = Self>
+    + core::ops::SubAssign
+    + core::ops::Rem<Output = Self>
+    + core::ops::BitAnd<Output = Self>
+    + core::ops::BitOr<Output = Self>
+    + core::ops::BitOrAssign
+    + core::ops::BitXor<Output = Self>
+    + core::ops::BitXorAssign
+    + core::ops::Shl<usize, Output = Self>
+    + core::ops::Shr<usize, Output = Self>
+{
+    const MAX: Self;
+
+    const ZERO: Self;
+    const ONE: Self;
+    const TWO: Self;
+
+    fn is_odd(self) -> bool {
+        self % Self::TWO == Self::ONE
+    }
+
+    fn wrapping_add(self, rhs: Self) -> Self;
+    fn wrapping_sub(self, rhs: Self) -> Self;
+}
+
+#[doc(hidden)]
+pub trait PackableUInt: UInt {
+    type PackedUInt: UInt + From<Self> + TryInto<Self>;
+
+    fn pack(self, lower: Self) -> Self::PackedUInt {
+        (Self::PackedUInt::from(self) << (core::mem::size_of::<Self>() * 8))
+            | Self::PackedUInt::from(lower)
+    }
+    fn unpack(packed: Self::PackedUInt) -> [Self; 2];
+}
+
+macro_rules! _impl_packable_helper {
+    () => {};
+    ($last:ty) => {};
+    ($small:ty, $large:ty $(,$rest:ty)* ) => {
+        impl PackableUInt for $small {
+            type PackedUInt = $large;
+
+            fn unpack(packed: Self::PackedUInt) -> [Self; 2] {
+                let lower = packed & Self::PackedUInt::from(Self::MAX);
+                let upper = packed >> (core::mem::size_of::<Self>() * 8);
+                [upper as Self, lower as Self]
+            }
+        }
+    };
+}
+
+_impl_packable_helper! { u8, u16, u32, u64, u128 }
+
+#[doc(hidden)]
+#[cfg(feature = "serde")]
+pub trait SerdeTraitAliasHelper: serde::Serialize + serde::de::DeserializeOwned {}
+
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize + serde::de::DeserializeOwned> SerdeTraitAliasHelper for T {}
+
+#[doc(hidden)]
+#[cfg(not(feature = "serde"))]
+pub trait SerdeTraitAliasHelper {}
+
+#[cfg(not(feature = "serde"))]
+impl<T> SerdeTraitAliasHelper for T {}
+
+#[doc(hidden)]
+pub trait KeyIndex: UInt + SerdeTraitAliasHelper + private::Sealed {
+    fn from_usize(u: usize) -> Self;
+    fn as_usize(self) -> usize;
+}
+
+#[doc(hidden)]
+pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable + private::Sealed {
+    #[doc(hidden)]
+    fn new_or_1(self) -> Self::NonZero;
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+macro_rules! _impl_key_helper {
+    ($($uint:ident),*) => {
+        $(
+            impl private::Sealed for $uint {}
+            impl UInt for $uint {
+                const MAX: Self = core::$uint::MAX;
+                const ZERO: Self = 0;
+                const ONE: Self = 1;
+                const TWO: Self = 2;
+
+                fn wrapping_add(self, rhs: Self) -> Self {
+                    self.wrapping_add(rhs)
+                }
+
+                fn wrapping_sub(self, rhs: Self) -> Self {
+                    self.wrapping_sub(rhs)
+                }
+            }
+            impl KeyIndex for $uint {
+                #[allow(trivial_numeric_casts)]
+                fn from_usize(u: usize) -> Self {
+                    u as Self
+                }
+
+                #[allow(trivial_numeric_casts)]
+                fn as_usize(self) -> usize {
+                    self as usize
+                }
+            }
+            impl KeyVersion for $uint {
+                fn new_or_1(self) -> Self::NonZero {
+                    unsafe { Self::NonZero::new_unchecked(self | 1) }
+                }
+            }
+        )*
+    };
+}
+
+_impl_key_helper! { u8, u16, u32, u64, u128, usize }
 
 /// A helper macro to create new key types. If you use a new key type for each
 /// slot map you create you can entirely prevent using the wrong key on the
@@ -440,22 +637,25 @@ pub unsafe trait Key:
 /// ```
 #[macro_export(local_inner_macros)]
 macro_rules! new_key_type {
-    ( $(#[$outer:meta])* $vis:vis struct $name:ident; $($rest:tt)* ) => {
+    ( $(#[$outer:meta])* $vis:vis struct $name:ident($ki:ty, $kv:ty); $($rest:tt)* ) => {
         $(#[$outer])*
         #[derive(Copy, Clone, Default,
                  Eq, PartialEq, Ord, PartialOrd,
                  Hash, Debug)]
         #[repr(transparent)]
-        $vis struct $name($crate::KeyData);
+        $vis struct $name($crate::KeyData<$ki, $kv>);
 
-        impl $crate::__impl::From<$crate::KeyData> for $name {
-            fn from(k: $crate::KeyData) -> Self {
+        impl $crate::__impl::From<$crate::KeyData<$ki, $kv>> for $name {
+            fn from(k: $crate::KeyData<$ki, $kv>) -> Self {
                 $name(k)
             }
         }
 
         unsafe impl $crate::Key for $name {
-            fn data(&self) -> $crate::KeyData {
+            type Index = $ki;
+            type Version = $kv;
+
+            fn data(&self) -> $crate::KeyData<$ki, $kv> {
                 self.0
             }
         }
@@ -464,7 +664,9 @@ macro_rules! new_key_type {
 
         $crate::new_key_type!($($rest)*);
     };
-
+    ( $(#[$outer:meta])* $vis:vis struct $name:ident; $($rest:tt)* ) => {
+        $crate::new_key_type!($(#[$outer])* $vis struct $name(u32, u32); $($rest)*);
+    };
     () => {}
 }
 
@@ -487,8 +689,10 @@ macro_rules! __serialize_key {
             where
                 D: $crate::__impl::Deserializer<'de>,
             {
-                let key_data: $crate::KeyData =
-                    $crate::__impl::Deserialize::deserialize(deserializer)?;
+                let key_data: $crate::KeyData<
+                    <$name as $crate::Key>::Index,
+                    <$name as $crate::Key>::Version,
+                > = $crate::__impl::Deserialize::deserialize(deserializer)?;
                 Ok(key_data.into())
             }
         }
@@ -515,17 +719,17 @@ mod serialize {
     use super::*;
 
     #[derive(Serialize, Deserialize)]
-    pub struct SerKey {
-        idx: u32,
-        version: u32,
+    pub struct SerKey<I, V> {
+        idx: I,
+        version: V,
     }
 
-    impl Serialize for KeyData {
+    impl<I: KeyIndex, V: KeyVersion> Serialize for KeyData<I, V> {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
-            let ser_key = SerKey {
+            let ser_key = SerKey::<I, V> {
                 idx: self.idx,
                 version: self.version.get(),
             };
@@ -533,19 +737,19 @@ mod serialize {
         }
     }
 
-    impl<'de> Deserialize<'de> for KeyData {
+    impl<'de, I: KeyIndex, V: KeyVersion> Deserialize<'de> for KeyData<I, V> {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
         {
-            let mut ser_key: SerKey = Deserialize::deserialize(deserializer)?;
+            let mut ser_key: SerKey<I, V> = Deserialize::deserialize(deserializer)?;
 
             // Ensure a.is_null() && b.is_null() implies a == b.
-            if ser_key.idx == core::u32::MAX {
-                ser_key.version = 1;
+            if ser_key.idx == UInt::MAX {
+                ser_key.version = UInt::ONE;
             }
 
-            ser_key.version |= 1; // Ensure version is odd.
+            ser_key.version |= UInt::ONE; // Ensure version is odd.
             Ok(Self::new(ser_key.idx, ser_key.version))
         }
     }
@@ -635,7 +839,7 @@ mod tests {
 
         // Even if a malicious entity sends up even (unoccupied) versions in the
         // key, we make the version point to the occupied version.
-        let malicious: KeyData = serde_json::from_str(&r#"{"idx":0,"version":4}"#).unwrap();
+        let malicious: KeyData<u32, u32> = serde_json::from_str(&r#"{"idx":0,"version":4}"#).unwrap();
         assert_eq!(malicious.version.get(), 5);
     }
 }

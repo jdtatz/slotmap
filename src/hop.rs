@@ -26,51 +26,51 @@ use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
 
 use crate::util::{Never, UnwrapUnchecked};
-use crate::{DefaultKey, Key, KeyData};
+use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UInt};
 
 // Metadata to maintain the freelist.
 #[derive(Clone, Copy, Debug)]
-struct FreeListEntry {
-    next: u32,
-    prev: u32,
-    other_end: u32,
+struct FreeListEntry<I: KeyIndex> {
+    next: I,
+    prev: I,
+    other_end: I,
 }
 
 // Storage inside a slot or metadata for the freelist when vacant.
-union SlotUnion<T> {
+union SlotUnion<T, I: KeyIndex> {
     value: ManuallyDrop<T>,
-    free: FreeListEntry,
+    free: FreeListEntry<I>,
 }
 
 // A slot, which represents storage for a value and a current version.
 // Can be occupied or vacant.
-struct Slot<T> {
-    u: SlotUnion<T>,
-    version: u32, // Even = vacant, odd = occupied.
+struct Slot<T, I: KeyIndex, V: KeyVersion> {
+    u: SlotUnion<T, I>,
+    version: V, // Even = vacant, odd = occupied.
 }
 
 // Safe API to read a slot.
-enum SlotContent<'a, T: 'a> {
+enum SlotContent<'a, T: 'a, I: KeyIndex> {
     Occupied(&'a T),
-    Vacant(&'a FreeListEntry),
+    Vacant(&'a FreeListEntry<I>),
 }
 
-enum SlotContentMut<'a, T: 'a> {
+enum SlotContentMut<'a, T: 'a, I: KeyIndex> {
     OccupiedMut(&'a mut T),
-    VacantMut(&'a mut FreeListEntry),
+    VacantMut(&'a mut FreeListEntry<I>),
 }
 
 use self::SlotContent::{Occupied, Vacant};
 use self::SlotContentMut::{OccupiedMut, VacantMut};
 
-impl<T> Slot<T> {
+impl<T, I: KeyIndex, V: KeyVersion> Slot<T, I, V> {
     // Is this slot occupied?
     #[inline(always)]
     pub fn occupied(&self) -> bool {
-        self.version % 2 == 1
+        self.version.is_odd()
     }
 
-    pub fn get(&self) -> SlotContent<T> {
+    pub fn get(&self) -> SlotContent<T, I> {
         unsafe {
             if self.occupied() {
                 Occupied(&*self.u.value)
@@ -80,7 +80,7 @@ impl<T> Slot<T> {
         }
     }
 
-    pub fn get_mut(&mut self) -> SlotContentMut<T> {
+    pub fn get_mut(&mut self) -> SlotContentMut<T, I> {
         unsafe {
             if self.occupied() {
                 OccupiedMut(&mut *self.u.value)
@@ -91,7 +91,7 @@ impl<T> Slot<T> {
     }
 }
 
-impl<T> Drop for Slot<T> {
+impl<T, I: KeyIndex, V: KeyVersion> Drop for Slot<T, I, V> {
     fn drop(&mut self) {
         if core::mem::needs_drop::<T>() && self.occupied() {
             // This is safe because we checked that we're occupied.
@@ -102,7 +102,7 @@ impl<T> Drop for Slot<T> {
     }
 }
 
-impl<T: Clone> Clone for Slot<T> {
+impl<T: Clone, I: KeyIndex, V: KeyVersion> Clone for Slot<T, I, V> {
     fn clone(&self) -> Self {
         Self {
             u: match self.get() {
@@ -130,7 +130,7 @@ impl<T: Clone> Clone for Slot<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Slot<T> {
+impl<T: fmt::Debug, I: KeyIndex, V: KeyVersion> fmt::Debug for Slot<T, I, V> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut builder = fmt.debug_struct("Slot");
         builder.field("version", &self.version);
@@ -146,8 +146,8 @@ impl<T: fmt::Debug> fmt::Debug for Slot<T> {
 /// See [crate documentation](crate) for more details.
 #[derive(Debug)]
 pub struct HopSlotMap<K: Key, V> {
-    slots: Vec<Slot<V>>,
-    num_elems: u32,
+    slots: Vec<Slot<V, K::Index, K::Version>>,
+    num_elems: <K as Key>::Index,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -220,17 +220,17 @@ impl<K: Key, V> HopSlotMap<K, V> {
         slots.push(Slot {
             u: SlotUnion {
                 free: FreeListEntry {
-                    next: 0,
-                    prev: 0,
-                    other_end: 0,
+                    next: UInt::ZERO,
+                    prev: UInt::ZERO,
+                    other_end: UInt::ZERO,
                 },
             },
-            version: 0,
+            version: UInt::ZERO,
         });
 
         Self {
             slots,
-            num_elems: 0,
+            num_elems: UInt::ZERO,
             _k: PhantomData,
         }
     }
@@ -248,7 +248,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// assert_eq!(sm.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        self.num_elems as usize
+        self.num_elems.as_usize()
     }
 
     /// Returns if the slot map is empty.
@@ -264,7 +264,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// assert_eq!(sm.is_empty(), true);
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.num_elems == 0
+        self.num_elems == UInt::ZERO
     }
 
     /// Returns the number of elements the [`HopSlotMap`] can hold without
@@ -341,7 +341,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     pub fn contains_key(&self, key: K) -> bool {
         let kd = key.data();
         self.slots
-            .get(kd.idx as usize)
+            .get(kd.idx.as_usize())
             .map_or(false, |slot| slot.version == kd.version.get())
     }
 
@@ -367,10 +367,10 @@ impl<K: Key, V> HopSlotMap<K, V> {
     }
 
     // Helper function to make using the freelist painless.
-    // For that same ergonomy it uses u32, not usize as index.
+    // For that same ergonomy it uses <K as Key>::Index, not usize as index.
     // Safe iff idx is a valid index and the slot at that index is vacant.
-    unsafe fn freelist(&mut self, idx: u32) -> &mut FreeListEntry {
-        &mut self.slots.get_unchecked_mut(idx as usize).u.free
+    unsafe fn freelist(&mut self, idx: <K as Key>::Index) -> &mut FreeListEntry<K::Index> {
+        &mut self.slots.get_unchecked_mut(idx.as_usize()).u.free
     }
 
     /// Inserts a value given by `f` into the slot map. The key where the
@@ -424,26 +424,26 @@ impl<K: Key, V> HopSlotMap<K, V> {
         F: FnOnce(K) -> Result<V, E>,
     {
         // In case f panics, we don't make any changes until we have the value.
-        let new_num_elems = self.num_elems + 1;
-        if new_num_elems == core::u32::MAX {
+        let new_num_elems = self.num_elems + UInt::ONE;
+        if new_num_elems == UInt::MAX {
             panic!("HopSlotMap number of elements overflow");
         }
 
         // All unsafe accesses here are safe due to the invariants of the slot
         // map freelist.
         unsafe {
-            let head = self.freelist(0).next;
+            let head = self.freelist(UInt::ZERO).next;
 
             // We have a contiguous block of vacant slots starting at head.
             // Put our new element at the back slot.
             let front = head;
             let back = self.freelist(front).other_end;
-            let slot_idx = back as usize;
+            let slot_idx = back.as_usize();
 
             // Freelist is empty.
             if slot_idx == 0 {
-                let version = 1;
-                let key = KeyData::new(self.slots.len() as u32, version).into();
+                let version = UInt::ONE;
+                let key = KeyData::new(KeyIndex::from_usize(self.slots.len()), version).into();
 
                 self.slots.push(Slot {
                     u: SlotUnion {
@@ -456,19 +456,19 @@ impl<K: Key, V> HopSlotMap<K, V> {
             }
 
             // Compute value first in case f panics or returns an error.
-            let occupied_version = self.slots[slot_idx].version | 1;
-            let key = KeyData::new(slot_idx as u32, occupied_version).into();
+            let occupied_version = self.slots[slot_idx].version | UInt::ONE;
+            let key = KeyData::new(KeyIndex::from_usize(slot_idx), occupied_version).into();
             let value = f(key)?;
 
             // Update freelist.
             if front == back {
                 // Used last slot in this block, move next one to head.
                 let new_head = self.freelist(front).next;
-                self.freelist(0).next = new_head;
-                self.freelist(new_head).prev = 0;
+                self.freelist(UInt::ZERO).next = new_head;
+                self.freelist(new_head).prev = UInt::ZERO;
             } else {
                 // Continue using this block, only need to update other_ends.
-                let new_back = back - 1;
+                let new_back = back - UInt::ONE;
                 self.freelist(new_back).other_end = front;
                 self.freelist(front).other_end = new_back;
             }
@@ -488,7 +488,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     unsafe fn remove_from_slot(&mut self, idx: usize) -> V {
         // Remove value from slot.
         let slot = self.slots.get_unchecked_mut(idx);
-        slot.version = slot.version.wrapping_add(1);
+        slot.version = slot.version.wrapping_add(UInt::ONE);
         let value = ManuallyDrop::take(&mut slot.u.value);
 
         // This is safe and can't underflow because of the sentinel element at
@@ -499,23 +499,23 @@ impl<K: Key, V> HopSlotMap<K, V> {
         // Maintain freelist by either appending/prepending this slot to a
         // contiguous block to the left or right, merging the two blocks to the
         // left and right or inserting a new block.
-        let i = idx as u32;
+        let i = KeyIndex::from_usize(idx);
         match (left_vacant, right_vacant) {
             (false, false) => {
                 // New block, insert it at the tail.
-                let old_tail = self.freelist(0).prev;
-                self.freelist(0).prev = i;
+                let old_tail = self.freelist(UInt::ZERO).prev;
+                self.freelist(UInt::ZERO).prev = i;
                 self.freelist(old_tail).next = i;
                 *self.freelist(i) = FreeListEntry {
                     other_end: i,
-                    next: 0,
+                    next: UInt::ZERO,
                     prev: old_tail,
                 };
             },
 
             (false, true) => {
                 // Prepend to vacant block on right.
-                let front_data = *self.freelist(i + 1);
+                let front_data = *self.freelist(i + UInt::ONE);
 
                 // Since the start of this block moved we must update the pointers to it.
                 self.freelist(front_data.other_end).other_end = i;
@@ -526,7 +526,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
 
             (true, false) => {
                 // Append to vacant block on left.
-                let front = self.freelist(i - 1).other_end;
+                let front = self.freelist(i - UInt::ONE).other_end;
                 self.freelist(i).other_end = front;
                 self.freelist(front).other_end = i;
             },
@@ -534,19 +534,19 @@ impl<K: Key, V> HopSlotMap<K, V> {
             (true, true) => {
                 // We must merge left and right.
                 // First snip right out of the freelist.
-                let right = *self.freelist(i + 1);
+                let right = *self.freelist(i + UInt::ONE);
                 self.freelist(right.prev).next = right.next;
                 self.freelist(right.next).prev = right.prev;
 
                 // Now update endpoints.
-                let front = self.freelist(i - 1).other_end;
+                let front = self.freelist(i - UInt::ONE).other_end;
                 let back = right.other_end;
                 self.freelist(front).other_end = back;
                 self.freelist(back).other_end = front;
             },
         }
 
-        self.num_elems -= 1;
+        self.num_elems -= UInt::ONE;
 
         value
     }
@@ -567,7 +567,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
         let kd = key.data();
         if self.contains_key(key) {
             // This is safe because we know that the slot is occupied.
-            Some(unsafe { self.remove_from_slot(kd.idx as usize) })
+            Some(unsafe { self.remove_from_slot(kd.idx.as_usize()) })
         } else {
             None
         }
@@ -601,19 +601,19 @@ impl<K: Key, V> HopSlotMap<K, V> {
         F: FnMut(K, &mut V) -> bool,
     {
         let mut elems_left_to_scan = self.len();
-        let mut cur = unsafe { self.slots.get_unchecked(0).u.free.other_end as usize + 1 };
+        let mut cur = unsafe { self.slots.get_unchecked(0).u.free.other_end.as_usize() + 1 };
         while elems_left_to_scan > 0 {
             // This is safe because removing elements does not shrink slots, cur always
             // points to an occupied slot.
             let idx = cur;
             let slot = unsafe { self.slots.get_unchecked_mut(cur) };
             let version = slot.version;
-            let key = KeyData::new(cur as u32, version).into();
+            let key = KeyData::new(KeyIndex::from_usize(cur), version).into();
             let should_remove = !f(key, unsafe { &mut *slot.u.value });
 
             cur = match self.slots.get(cur + 1).map(|s| s.get()) {
                 Some(Occupied(_)) => cur + 1,
-                Some(Vacant(free)) => free.other_end as usize + 1,
+                Some(Vacant(free)) => free.other_end.as_usize() + 1,
                 None => 0,
             };
 
@@ -664,7 +664,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// ```
     pub fn drain(&mut self) -> Drain<K, V> {
         Drain {
-            cur: unsafe { self.slots.get_unchecked(0).u.free.other_end as usize + 1 },
+            cur: unsafe { self.slots.get_unchecked(0).u.free.other_end.as_usize() + 1 },
             sm: self,
         }
     }
@@ -686,7 +686,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
         // This is safe because we check version first and a key always contains
         // an odd version, thus we are occupied.
         self.slots
-            .get(kd.idx as usize)
+            .get(kd.idx.as_usize())
             .filter(|slot| slot.version == kd.version.get())
             .map(|slot| unsafe { &*slot.u.value })
     }
@@ -711,7 +711,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// ```
     pub unsafe fn get_unchecked(&self, key: K) -> &V {
         debug_assert!(self.contains_key(key));
-        &self.slots.get_unchecked(key.data().idx as usize).u.value
+        &self.slots.get_unchecked(key.data().idx.as_usize()).u.value
     }
 
     /// Returns a mutable reference to the value corresponding to the key.
@@ -732,7 +732,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
         // This is safe because we check version first and a key always contains
         // an odd version, thus we are occupied.
         self.slots
-            .get_mut(kd.idx as usize)
+            .get_mut(kd.idx.as_usize())
             .filter(|slot| slot.version == kd.version.get())
             .map(|slot| unsafe { &mut *slot.u.value })
     }
@@ -758,7 +758,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// ```
     pub unsafe fn get_unchecked_mut(&mut self, key: K) -> &mut V {
         debug_assert!(self.contains_key(key));
-        &mut self.slots.get_unchecked_mut(key.data().idx as usize).u.value
+        &mut self.slots.get_unchecked_mut(key.data().idx.as_usize()).u.value
     }
 
     /// Returns mutable references to the values corresponding to the given
@@ -802,8 +802,8 @@ impl<K: Key, V> HopSlotMap<K, V> {
             // mark it as unoccupied so duplicate keys would show up as invalid.
             // This gives us a linear time disjointness check.
             unsafe {
-                let slot = self.slots.get_unchecked_mut(kd.idx as usize);
-                slot.version ^= 1;
+                let slot = self.slots.get_unchecked_mut(kd.idx.as_usize());
+                slot.version ^= UInt::ONE;
                 ptrs[i] = MaybeUninit::new(&mut *slot.u.value);
             }
             i += 1;
@@ -811,9 +811,9 @@ impl<K: Key, V> HopSlotMap<K, V> {
 
         // Undo temporary unoccupied markings.
         for k in &keys[..i] {
-            let idx = k.data().idx as usize;
+            let idx = k.data().idx.as_usize();
             unsafe {
-                self.slots.get_unchecked_mut(idx).version ^= 1;
+                self.slots.get_unchecked_mut(idx).version ^= UInt::ONE;
             }
         }
 
@@ -878,7 +878,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// ```
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
-            cur: unsafe { self.slots.get_unchecked(0).u.free.other_end as usize + 1 },
+            cur: unsafe { self.slots.get_unchecked(0).u.free.other_end.as_usize() + 1 },
             num_left: self.len(),
             slots: &self.slots[..],
             _k: PhantomData,
@@ -1042,7 +1042,7 @@ pub struct Drain<'a, K: Key + 'a, V: 'a> {
 pub struct IntoIter<K: Key, V> {
     cur: usize,
     num_left: usize,
-    slots: Vec<Slot<V>>,
+    slots: Vec<Slot<V, K::Index, K::Version>>,
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1053,7 +1053,7 @@ pub struct IntoIter<K: Key, V> {
 pub struct Iter<'a, K: Key + 'a, V: 'a> {
     cur: usize,
     num_left: usize,
-    slots: &'a [Slot<V>],
+    slots: &'a [Slot<V, K::Index, K::Version>],
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1075,7 +1075,7 @@ impl<'a, K: 'a + Key, V: 'a> Clone for Iter<'a, K, V> {
 pub struct IterMut<'a, K: Key + 'a, V: 'a> {
     cur: usize,
     num_left: usize,
-    slots: &'a mut [Slot<V>],
+    slots: &'a mut [Slot<V, K::Index, K::Version>],
     _k: PhantomData<fn(K) -> K>,
 }
 
@@ -1133,11 +1133,11 @@ impl<'a, K: Key, V> Iterator for Drain<'a, K, V> {
         let idx = self.cur;
         self.cur = match self.sm.slots.get(idx + 1).map(|s| s.get()) {
             Some(Occupied(_)) => idx + 1,
-            Some(Vacant(free)) => free.other_end as usize + 1,
+            Some(Vacant(free)) => free.other_end.as_usize() + 1,
             None => 0,
         };
 
-        let key = KeyData::new(idx as u32, unsafe { self.sm.slots.get_unchecked(idx).version });
+        let key = KeyData::new(KeyIndex::from_usize(idx), unsafe { self.sm.slots.get_unchecked(idx).version });
         Some((key.into(), unsafe { self.sm.remove_from_slot(idx) }))
     }
 
@@ -1164,7 +1164,7 @@ impl<K: Key, V> Iterator for IntoIter<K, V> {
             Occupied(_) => self.cur,
             Vacant(free) => {
                 // Skip block of contiguous vacant slots.
-                let idx = free.other_end as usize + 1;
+                let idx = free.other_end.as_usize() + 1;
                 if idx >= self.slots.len() {
                     return None;
                 }
@@ -1175,8 +1175,8 @@ impl<K: Key, V> Iterator for IntoIter<K, V> {
         self.cur = idx + 1;
         self.num_left -= 1;
         let slot = &mut self.slots[idx];
-        let key = KeyData::new(idx as u32, slot.version).into();
-        slot.version = 0; // Prevent dropping after extracting the value.
+        let key = KeyData::new(KeyIndex::from_usize(idx), slot.version).into();
+        slot.version = UInt::ZERO; // Prevent dropping after extracting the value.
         Some((key, unsafe { ManuallyDrop::take(&mut slot.u.value) }))
     }
 
@@ -1198,12 +1198,12 @@ impl<'a, K: Key, V> Iterator for Iter<'a, K, V> {
 
         let idx = match unsafe { self.slots.get_unchecked(self.cur).get() } {
             Occupied(_) => self.cur,
-            Vacant(free) => free.other_end as usize + 1,
+            Vacant(free) => free.other_end.as_usize() + 1,
         };
 
         self.cur = idx + 1;
         let slot = unsafe { self.slots.get_unchecked(idx) };
-        let key = KeyData::new(idx as u32, slot.version).into();
+        let key = KeyData::new(KeyIndex::from_usize(idx), slot.version).into();
         Some((key, unsafe { &*slot.u.value }))
     }
 
@@ -1224,7 +1224,7 @@ impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
             Occupied(_) => self.cur,
             Vacant(free) => {
                 // Skip block of contiguous vacant slots.
-                let idx = free.other_end as usize + 1;
+                let idx = free.other_end.as_usize() + 1;
                 if idx >= self.slots.len() {
                     return None;
                 }
@@ -1243,7 +1243,7 @@ impl<'a, K: Key, V> Iterator for IterMut<'a, K, V> {
             let ptr: *mut V = &mut *slot.u.value;
             &mut *ptr
         };
-        Some((KeyData::new(idx as u32, version).into(), value_ref))
+        Some((KeyData::new(KeyIndex::from_usize(idx), version).into(), value_ref))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1343,17 +1343,17 @@ mod serialize {
     use super::*;
 
     #[derive(Serialize, Deserialize)]
-    struct SerdeSlot<T> {
+    struct SerdeSlot<T, V> {
         value: Option<T>,
-        version: u32,
+        version: V,
     }
 
-    impl<T: Serialize> Serialize for Slot<T> {
+    impl<T: Serialize, I: KeyIndex, V: KeyVersion> Serialize for Slot<T, I, V> {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
-            let serde_slot = SerdeSlot {
+            let serde_slot = SerdeSlot::<_, V> {
                 version: self.version,
                 value: match self.get() {
                     Occupied(value) => Some(value),
@@ -1364,7 +1364,7 @@ mod serialize {
         }
     }
 
-    impl<'de, T> Deserialize<'de> for Slot<T>
+    impl<'de, T, I: KeyIndex, V: KeyVersion> Deserialize<'de> for Slot<T, I, V>
     where
         T: Deserialize<'de>,
     {
@@ -1372,8 +1372,8 @@ mod serialize {
         where
             D: Deserializer<'de>,
         {
-            let serde_slot: SerdeSlot<T> = Deserialize::deserialize(deserializer)?;
-            let occupied = serde_slot.version % 2 == 1;
+            let serde_slot: SerdeSlot<T, V> = Deserialize::deserialize(deserializer)?;
+            let occupied = serde_slot.version.is_odd();
             if occupied ^ serde_slot.value.is_some() {
                 return Err(de::Error::custom(&"inconsistent occupation in Slot"));
             }
@@ -1385,9 +1385,9 @@ mod serialize {
                     },
                     None => SlotUnion {
                         free: FreeListEntry {
-                            next: 0,
-                            prev: 0,
-                            other_end: 0,
+                            next: UInt::ZERO,
+                            prev: UInt::ZERO,
+                            other_end: UInt::ZERO,
                         },
                     },
                 },
@@ -1410,24 +1410,24 @@ mod serialize {
         where
             D: Deserializer<'de>,
         {
-            let mut slots: Vec<Slot<V>> = Deserialize::deserialize(deserializer)?;
-            if slots.len() >= u32::max_value() as usize {
+            let mut slots: Vec<Slot<V, K::Index, K::Version>> = Deserialize::deserialize(deserializer)?;
+            if slots.len() >= <<K as Key>::Index as UInt>::MAX.as_usize() {
                 return Err(de::Error::custom(&"too many slots"));
             }
 
             // Ensure the first slot exists and is empty for the sentinel.
-            if slots.get(0).map_or(true, |slot| slot.version % 2 == 1) {
+            if slots.get(0).map_or(true, |slot| slot.version.is_odd()) {
                 return Err(de::Error::custom(&"first slot not empty"));
             }
 
             slots[0].u.free = FreeListEntry {
-                next: 0,
-                prev: 0,
-                other_end: 0,
+                next: UInt::ZERO,
+                prev: UInt::ZERO,
+                other_end: UInt::ZERO,
             };
 
             // We have our slots, rebuild freelist.
-            let mut num_elems = 0;
+            let mut num_elems = UInt::ZERO;
             let mut prev = 0;
             let mut i = 0;
             while i < slots.len() {
@@ -1440,12 +1440,12 @@ mod serialize {
 
                 // Update freelist.
                 unsafe {
-                    slots[back].u.free.other_end = front as u32;
-                    slots[prev].u.free.next = front as u32;
+                    slots[back].u.free.other_end = KeyIndex::from_usize(front);
+                    slots[prev].u.free.next = KeyIndex::from_usize(front);
                     slots[front].u.free = FreeListEntry {
-                        next: 0,
-                        prev: prev as u32,
-                        other_end: back as u32,
+                        next: UInt::ZERO,
+                        prev: KeyIndex::from_usize(prev),
+                        other_end: KeyIndex::from_usize(back),
                     };
                 }
 
@@ -1453,7 +1453,7 @@ mod serialize {
 
                 // Skip occupied slots.
                 while i < slots.len() && slots[i].occupied() {
-                    num_elems += 1;
+                    num_elems += UInt::ONE;
                     i += 1;
                 }
             }
@@ -1601,7 +1601,7 @@ mod tests {
                         }
                         if hm_keys.is_empty() { continue; }
 
-                        let idx = val as usize % hm_keys.len();
+                        let idx = val.as_usize() % hm_keys.len();
                         if hm.remove(&hm_keys[idx]) != sm.remove(sm_keys[idx]) {
                             return false;
                         }
@@ -1610,7 +1610,7 @@ mod tests {
                     // Access.
                     2 => {
                         if hm_keys.is_empty() { continue; }
-                        let idx = val as usize % hm_keys.len();
+                        let idx = val.as_usize() % hm_keys.len();
                         let (hm_key, sm_key) = (&hm_keys[idx], sm_keys[idx]);
 
                         if hm.contains_key(hm_key) != sm.contains_key(sm_key) ||
