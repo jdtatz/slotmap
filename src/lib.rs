@@ -222,7 +222,7 @@ pub mod sparse_secondary;
 pub(crate) mod util;
 
 use core::fmt::{self, Debug, Formatter};
-use std::convert::TryInto;
+use core::num::Wrapping;
 
 #[doc(inline)]
 pub use crate::basic::SlotMap;
@@ -277,9 +277,7 @@ impl<I: KeyIndex, V: KeyVersion> KeyData<I, V> {
     fn is_null(self) -> bool {
         self.idx == I::MAX
     }
-}
 
-impl<T: PackableUInt + KeyIndex + KeyVersion> KeyData<T, T> {
     /// Returns the key data as a packed integer. No guarantees about its value
     /// are made other than that passing it to [`from_ffi`](Self::from_ffi)
     /// will return a key equal to the original.
@@ -294,16 +292,16 @@ impl<T: PackableUInt + KeyIndex + KeyVersion> KeyData<T, T> {
     /// function.
     ///
     /// [`serde`]: crate#serialization-through-serde-no_std-support-and-unstable-features
-    pub fn as_ffi(self) -> T::PackedUInt {
+    pub fn as_ffi(self) -> V::Packed where V: Pack<I> {
         self.version.get().pack(self.idx)
     }
 
     /// Iff `value` is a value received from `k.as_ffi()`, returns a key equal
     /// to `k`. Otherwise the behavior is safe but unspecified.
-    pub fn from_ffi(value: T::PackedUInt) -> Self {
-        let [upper, lower] = T::unpack(value);
-        let idx = upper;
-        let version = lower | T::ONE; // Ensure version is odd.
+    pub fn from_ffi(value: V::Packed) -> Self where V: Pack<I> {
+        let (upper, lower) = V::unpack(value);
+        let idx = lower;
+        let version = upper | V::ONE; // Ensure version is odd.
         Self::new(idx, version)
     }
 }
@@ -408,18 +406,17 @@ pub unsafe trait Key:
 
 // All the ops needed for implementing.
 #[doc(hidden)]
-pub trait NonZero:
+pub trait NonZero<Primitive>:
     Sized + Copy + Clone + core::fmt::Debug + core::fmt::Display + PartialEq
 {
-    type Primitive;
-    unsafe fn new_unchecked(n: Self::Primitive) -> Self;
-    fn new(n: Self::Primitive) -> Option<Self>;
-    fn get(self) -> Self::Primitive;
+    unsafe fn new_unchecked(n: Primitive) -> Self;
+    fn new(n: Primitive) -> Option<Self>;
+    fn get(self) -> Primitive;
 }
 
 #[doc(hidden)]
 pub trait NonZeroable: Sized {
-    type NonZero: NonZero<Primitive = Self>;
+    type NonZero: NonZero<Self>;
     unsafe fn as_nonzero_unchecked(self) -> Self::NonZero {
         Self::NonZero::new_unchecked(self)
     }
@@ -430,18 +427,31 @@ pub trait NonZeroable: Sized {
 
 macro_rules! _impl_nonzero_helper {
     ($uint:ty, $nonzero:ty) => {
-        impl NonZero for $nonzero {
-            type Primitive = $uint;
-            unsafe fn new_unchecked(n: Self::Primitive) -> Self {
+        impl NonZero<$uint> for $nonzero {
+            unsafe fn new_unchecked(n: $uint) -> Self {
                 <$nonzero>::new_unchecked(n)
             }
 
-            fn new(n: Self::Primitive) -> Option<Self> {
+            fn new(n: $uint) -> Option<Self> {
                 <$nonzero>::new(n)
             }
 
-            fn get(self) -> Self::Primitive {
+            fn get(self) -> $uint {
                 self.get()
+            }
+        }
+
+        impl NonZero<Wrapping<$uint>> for $nonzero {
+            unsafe fn new_unchecked(n: Wrapping<$uint>) -> Self {
+                Self::new_unchecked(n.0)
+            }
+
+            fn new(n: Wrapping<$uint>) -> Option<Self> {
+                Self::new(n.0)
+            }
+
+            fn get(self) -> Wrapping<$uint> {
+                Wrapping(self.get())
             }
         }
 
@@ -457,6 +467,13 @@ _impl_nonzero_helper! { u32, core::num::NonZeroU32 }
 _impl_nonzero_helper! { u64, core::num::NonZeroU64 }
 _impl_nonzero_helper! { u128, core::num::NonZeroU128 }
 _impl_nonzero_helper! { usize, core::num::NonZeroUsize }
+
+impl<T: NonZeroable> NonZeroable for Wrapping<T>
+where
+    <T as NonZeroable>::NonZero: NonZero<Wrapping<T>>,
+{
+    type NonZero = T::NonZero;
+}
 
 #[doc(hidden)]
 pub trait UInt:
@@ -497,34 +514,125 @@ pub trait UInt:
     fn wrapping_sub(self, rhs: Self) -> Self;
 }
 
-#[doc(hidden)]
-pub trait PackableUInt: UInt {
-    type PackedUInt: UInt + From<Self> + TryInto<Self>;
+macro_rules! _impl_uint_helper {
+    ($($uint:ident),*) => {
+        $(
+            impl UInt for $uint {
+                const MAX: Self = core::$uint::MAX;
+                const ZERO: Self = 0;
+                const ONE: Self = 1;
+                const TWO: Self = 2;
 
-    fn pack(self, lower: Self) -> Self::PackedUInt {
-        (Self::PackedUInt::from(self) << (core::mem::size_of::<Self>() * 8))
-            | Self::PackedUInt::from(lower)
+                fn wrapping_add(self, rhs: Self) -> Self {
+                    self.wrapping_add(rhs)
+                }
+
+                fn wrapping_sub(self, rhs: Self) -> Self {
+                    self.wrapping_sub(rhs)
+                }
+            }
+        )*
+    };
+}
+
+_impl_uint_helper! { u8, u16, u32, u64, u128, usize }
+
+impl<U: UInt> UInt for Wrapping<U>
+where
+    Self: core::ops::Add<Output = Self>
+        + core::ops::AddAssign
+        + core::ops::Sub<Output = Self>
+        + core::ops::SubAssign
+        + core::ops::Rem<Output = Self>
+        + core::ops::BitAnd<Output = Self>
+        + core::ops::BitOr<Output = Self>
+        + core::ops::BitOrAssign
+        + core::ops::BitXor<Output = Self>
+        + core::ops::BitXorAssign
+        + core::ops::Shl<usize, Output = Self>
+        + core::ops::Shr<usize, Output = Self>,
+{
+    const MAX: Self = Wrapping(U::MAX);
+
+    const ZERO: Self = Wrapping(U::ZERO);
+    const ONE: Self = Wrapping(U::ONE);
+    const TWO: Self = Wrapping(U::TWO);
+
+    fn wrapping_add(self, rhs: Self) -> Self {
+        self + rhs
     }
-    fn unpack(packed: Self::PackedUInt) -> [Self; 2];
+    fn wrapping_sub(self, rhs: Self) -> Self {
+        self - rhs
+    }
+}
+
+#[doc(hidden)]
+pub trait Pack<Rhs=Self>: Sized {
+    type Packed;
+
+    fn pack(self, lower: Rhs) -> Self::Packed;
+    fn unpack(packed: Self::Packed) -> (Self, Rhs);
 }
 
 macro_rules! _impl_packable_helper {
     () => {};
     ($last:ty) => {};
     ($small:ty, $large:ty $(,$rest:ty)* ) => {
-        impl PackableUInt for $small {
-            type PackedUInt = $large;
+        impl Pack for $small {
+            type Packed = $large;
 
-            fn unpack(packed: Self::PackedUInt) -> [Self; 2] {
-                let lower = packed & Self::PackedUInt::from(Self::MAX);
+            fn pack(self, lower: Self) -> Self::Packed {
+                (Self::Packed::from(self) << (core::mem::size_of::<Self>() * 8))
+                    | Self::Packed::from(lower)
+            }
+
+            fn unpack(packed: Self::Packed) -> (Self, Self) {
+                let lower = packed & Self::Packed::from(Self::MAX);
                 let upper = packed >> (core::mem::size_of::<Self>() * 8);
-                [upper as Self, lower as Self]
+                (upper as Self, lower as Self)
             }
         }
     };
 }
 
 _impl_packable_helper! { u8, u16, u32, u64, u128 }
+
+impl<U: Pack> Pack for Wrapping<U> {
+    type Packed = Wrapping<U::Packed>;
+
+    fn pack(self, lower: Self) -> Self::Packed {
+        Wrapping(self.0.pack(lower.0))
+    }
+    fn unpack(packed: Self::Packed) -> (Self, Self) {
+        let (high, low) = U::unpack(packed.0);
+        (Wrapping(high), Wrapping(low))
+    }
+}
+
+impl<U: Pack> Pack<U> for Wrapping<U> {
+    type Packed = U::Packed;
+
+    fn pack(self, lower: U) -> Self::Packed {
+        self.0.pack(lower)
+    }
+    fn unpack(packed: Self::Packed) -> (Self, U) {
+        let (high, low) = U::unpack(packed);
+        (Wrapping(high), low)
+    }
+}
+
+impl<U: Pack> Pack<Wrapping<U>> for U {
+    type Packed = <Self as Pack>::Packed;
+
+    fn pack(self, lower: Wrapping<Self>) -> Self::Packed {
+        self.pack(lower.0)
+    }
+    fn unpack(packed: Self::Packed) -> (Self, Wrapping<Self>) {
+        let (high, low) = Self::unpack(packed);
+        (high, Wrapping(low))
+    }
+}
+
 
 #[doc(hidden)]
 #[cfg(feature = "serde")]
@@ -541,39 +649,29 @@ pub trait SerdeTraitAliasHelper {}
 impl<T> SerdeTraitAliasHelper for T {}
 
 #[doc(hidden)]
-pub trait KeyIndex: UInt + SerdeTraitAliasHelper + private::Sealed {
+pub trait KeyIndex: UInt + SerdeTraitAliasHelper {
     fn from_usize(u: usize) -> Self;
     fn as_usize(self) -> usize;
 }
 
 #[doc(hidden)]
-pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable + private::Sealed {
+pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable {
     #[doc(hidden)]
-    fn new_or_1(self) -> Self::NonZero;
+    fn new_or_1(self) -> Self::NonZero {
+        unsafe { Self::NonZero::new_unchecked(self | Self::ONE) }
+    }
 }
 
-mod private {
-    pub trait Sealed {}
+impl<V: KeyVersion> KeyVersion for Wrapping<V>
+where
+    Wrapping<V>: UInt,
+    <V as NonZeroable>::NonZero: NonZero<Wrapping<V>>,
+{
 }
 
 macro_rules! _impl_key_helper {
     ($($uint:ident),*) => {
         $(
-            impl private::Sealed for $uint {}
-            impl UInt for $uint {
-                const MAX: Self = core::$uint::MAX;
-                const ZERO: Self = 0;
-                const ONE: Self = 1;
-                const TWO: Self = 2;
-
-                fn wrapping_add(self, rhs: Self) -> Self {
-                    self.wrapping_add(rhs)
-                }
-
-                fn wrapping_sub(self, rhs: Self) -> Self {
-                    self.wrapping_sub(rhs)
-                }
-            }
             impl KeyIndex for $uint {
                 #[allow(trivial_numeric_casts)]
                 fn from_usize(u: usize) -> Self {
@@ -585,11 +683,7 @@ macro_rules! _impl_key_helper {
                     self as usize
                 }
             }
-            impl KeyVersion for $uint {
-                fn new_or_1(self) -> Self::NonZero {
-                    unsafe { Self::NonZero::new_unchecked(self | 1) }
-                }
-            }
+            impl KeyVersion for $uint {}
         )*
     };
 }
