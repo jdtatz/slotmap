@@ -1,18 +1,9 @@
 use core::fmt::Debug;
 use core::hint::unreachable_unchecked;
 
-use crate::UInt;
-
 /// Internal stable replacement for !.
 #[derive(Debug)]
 pub enum Never {}
-
-/// Returns if a is an older version than b, taking into account wrapping of
-/// versions.
-pub fn is_older_version<U: UInt>(a: U, b: U) -> bool {
-    let diff = a.wrapping_sub(b);
-    diff >= (U::ONE << ((core::mem::size_of::<U>() * 8) - 1))
-}
 
 /// An unwrapper that checks on debug, doesn't check on release.
 /// UB if unwrapped on release mode when unwrap would panic.

@@ -342,7 +342,7 @@ impl<K: Key, V> DenseSlotMap<K, V> {
     fn free_slot(&mut self, slot_idx: usize) -> <K as Key>::Index {
         let slot = &mut self.slots[slot_idx];
         let value_idx = slot.idx_or_free;
-        slot.version = slot.version.wrapping_add(UInt::ONE);
+        slot.version = slot.version.wrapping_increment();
         slot.idx_or_free = self.free_head;
         self.free_head = KeyIndex::from_usize(slot_idx);
         value_idx

@@ -488,7 +488,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     unsafe fn remove_from_slot(&mut self, idx: usize) -> V {
         // Remove value from slot.
         let slot = self.slots.get_unchecked_mut(idx);
-        slot.version = slot.version.wrapping_add(UInt::ONE);
+        slot.version = slot.version.wrapping_increment();
         let value = ManuallyDrop::take(&mut slot.u.value);
 
         // This is safe and can't underflow because of the sentinel element at

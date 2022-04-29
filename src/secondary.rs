@@ -12,7 +12,6 @@ use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
 
 use super::{Key, KeyData};
-use crate::util::is_older_version;
 use crate::{KeyIndex, KeyVersion, NonZero, UInt};
 
 // This representation works because we don't have to store the versions
@@ -30,7 +29,7 @@ impl<T, V: KeyVersion> Slot<T, V> {
     pub fn new_occupied(version: V, value: T) -> Self {
         Occupied {
             value,
-            version: V::new_or_1(version),
+            version: V::new_and_odd(version),
         }
     }
 
@@ -321,7 +320,7 @@ impl<K: Key, V> SecondaryMap<K, V> {
 
         if slot.occupied() {
             // Don't replace existing newer values.
-            if is_older_version(kd.version.get(), slot.version()) {
+            if kd.version.get().is_older(slot.version()) {
                 return None;
             }
         } else {
@@ -839,7 +838,7 @@ impl<K: Key, V> SecondaryMap<K, V> {
                 kd,
                 _k: PhantomData,
             }))
-        } else if is_older_version(kd.version.get(), slot.version()) {
+        } else if kd.version.get().is_older(slot.version()) {
             None
         } else {
             Some(Entry::Vacant(VacantEntry {

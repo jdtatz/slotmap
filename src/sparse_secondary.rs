@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 use super::{Key, KeyData};
-use crate::util::{is_older_version, UnwrapUnchecked};
+use crate::util::UnwrapUnchecked;
 use crate::{KeyVersion, NonZero, UInt};
 
 #[derive(Debug, Clone)]
@@ -285,7 +285,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
             }
 
             // Don't replace existing newer values.
-            if is_older_version(kd.version.get(), slot.version) {
+            if kd.version.get().is_older(slot.version) {
                 return None;
             }
 
@@ -785,7 +785,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
         if let hash_map::Entry::Occupied(o) = self.slots.entry(kd.idx) {
             if o.get().version != kd.version.get() {
                 // Which is outdated, our key or the slot?
-                if is_older_version(o.get().version, kd.version.get()) {
+                if o.get().version.is_older(kd.version.get()) {
                     o.remove();
                 } else {
                     return None;

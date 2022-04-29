@@ -450,7 +450,7 @@ impl<K: Key, V> SlotMap<K, V> {
         slot.u.next_free = self.free_head;
         self.free_head = KeyIndex::from_usize(idx);
         self.num_elems -= UInt::ONE;
-        slot.version = slot.version.wrapping_add(UInt::ONE);
+        slot.version = slot.version.wrapping_increment();
 
         value
     }

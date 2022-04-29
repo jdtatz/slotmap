@@ -266,7 +266,7 @@ impl<I: KeyIndex, V: KeyVersion> KeyData<I, V> {
 
         Self {
             idx,
-            version: V::new_or_1(version),
+            version: V::new_and_odd(version),
         }
     }
 
@@ -509,9 +509,6 @@ pub trait UInt:
     fn is_odd(self) -> bool {
         self % Self::TWO == Self::ONE
     }
-
-    fn wrapping_add(self, rhs: Self) -> Self;
-    fn wrapping_sub(self, rhs: Self) -> Self;
 }
 
 macro_rules! _impl_uint_helper {
@@ -522,14 +519,6 @@ macro_rules! _impl_uint_helper {
                 const ZERO: Self = 0;
                 const ONE: Self = 1;
                 const TWO: Self = 2;
-
-                fn wrapping_add(self, rhs: Self) -> Self {
-                    self.wrapping_add(rhs)
-                }
-
-                fn wrapping_sub(self, rhs: Self) -> Self {
-                    self.wrapping_sub(rhs)
-                }
             }
         )*
     };
@@ -557,13 +546,6 @@ where
     const ZERO: Self = Wrapping(U::ZERO);
     const ONE: Self = Wrapping(U::ONE);
     const TWO: Self = Wrapping(U::TWO);
-
-    fn wrapping_add(self, rhs: Self) -> Self {
-        self + rhs
-    }
-    fn wrapping_sub(self, rhs: Self) -> Self {
-        self - rhs
-    }
 }
 
 #[doc(hidden)]
@@ -657,9 +639,14 @@ pub trait KeyIndex: UInt + SerdeTraitAliasHelper {
 #[doc(hidden)]
 pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable {
     #[doc(hidden)]
-    fn new_or_1(self) -> Self::NonZero {
+    fn new_and_odd(self) -> Self::NonZero {
         unsafe { Self::NonZero::new_unchecked(self | Self::ONE) }
     }
+
+    fn wrapping_increment(self) -> Self;
+    /// Returns if `self` is an older version than `rhs`, taking into account wrapping of
+    /// versions.
+    fn is_older(self, rhs: Self) -> bool;
 }
 
 impl<V: KeyVersion> KeyVersion for Wrapping<V>
@@ -667,6 +654,14 @@ where
     Wrapping<V>: UInt,
     <V as NonZeroable>::NonZero: NonZero<Wrapping<V>>,
 {
+    fn wrapping_increment(self) -> Self {
+        self + Self::ONE
+    }
+
+    fn is_older(self, rhs: Self) -> bool {
+        let diff = self - rhs;
+        diff >= (Self::ONE << ((core::mem::size_of::<Self>() * 8) - 1))
+    }
 }
 
 macro_rules! _impl_key_helper {
@@ -683,7 +678,15 @@ macro_rules! _impl_key_helper {
                     self as usize
                 }
             }
-            impl KeyVersion for $uint {}
+            impl KeyVersion for $uint {
+                fn wrapping_increment(self) -> Self {
+                    self.wrapping_add(1)
+                }
+                fn is_older(self, rhs: Self) -> bool {
+                    let diff = self.wrapping_sub(rhs);
+                    diff >= (Self::ONE << ((core::mem::size_of::<Self>() * 8) - 1))
+                }
+            }
         )*
     };
 }
@@ -877,9 +880,9 @@ mod tests {
 
     #[test]
     fn check_is_older_version() {
-        use super::util::is_older_version;
+        use super::KeyVersion;
 
-        let is_older = |a, b| is_older_version(a, b);
+        let is_older = |a: u32, b| a.is_older(b);
         assert!(!is_older(42, 42));
         assert!(is_older(0, 1));
         assert!(is_older(0, 1 << 31));
