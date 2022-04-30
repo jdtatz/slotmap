@@ -15,7 +15,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
 
 use crate::util::{Never, UnwrapUnchecked};
-use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UInt};
+use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UnsignedInt};
 
 // A slot, which represents storage for an index and a current version.
 // Can be occupied or vacant.
@@ -109,15 +109,15 @@ impl<K: Key, V> DenseSlotMap<K, V> {
         // conversion we have to have one as well.
         let mut slots = Vec::with_capacity(capacity + 1);
         slots.push(Slot {
-            idx_or_free: UInt::ZERO,
-            version: UInt::ZERO,
+            idx_or_free: UnsignedInt::ZERO,
+            version: UnsignedInt::ZERO,
         });
 
         DenseSlotMap {
             keys: Vec::with_capacity(capacity),
             values: Vec::with_capacity(capacity),
             slots,
-            free_head: UInt::ONE,
+            free_head: UnsignedInt::ONE,
         }
     }
 
@@ -305,14 +305,14 @@ impl<K: Key, V> DenseSlotMap<K, V> {
     where
         F: FnOnce(K) -> Result<V, E>,
     {
-        if self.len() >= (<<K as Key>::Index as UInt>::MAX - UInt::ONE).as_usize() {
+        if self.len() >= (<<K as Key>::Index as UnsignedInt>::MAX - UnsignedInt::ONE).as_usize() {
             panic!("DenseSlotMap number of elements overflow");
         }
 
         let idx = self.free_head;
 
         if let Some(slot) = self.slots.get_mut(idx.as_usize()) {
-            let occupied_version = slot.version | UInt::ONE;
+            let occupied_version = slot.version | UnsignedInt::ONE;
             let key = KeyData::new(idx, occupied_version).into();
 
             // Push value before adjusting slots/freelist in case f panics or returns an error.
@@ -325,11 +325,11 @@ impl<K: Key, V> DenseSlotMap<K, V> {
         }
 
         // Push value before adjusting slots/freelist in case f panics or returns an error.
-        let key = KeyData::new(idx, UInt::ONE).into();
+        let key = KeyData::new(idx, UnsignedInt::ONE).into();
         self.values.push(f(key)?);
         self.keys.push(key);
         self.slots.push(Slot {
-            version: UInt::ONE,
+            version: UnsignedInt::ONE,
             idx_or_free: KeyIndex::from_usize(self.keys.len() - 1),
         });
         self.free_head = KeyIndex::from_usize(self.slots.len());
@@ -611,7 +611,7 @@ impl<K: Key, V> DenseSlotMap<K, V> {
             // This gives us a linear time disjointness check.
             unsafe {
                 let slot = self.slots.get_unchecked_mut(kd.idx.as_usize());
-                slot.version ^= UInt::ONE;
+                slot.version ^= UnsignedInt::ONE;
                 let ptr = self.values.get_unchecked_mut(slot.idx_or_free.as_usize());
                 ptrs[i] = MaybeUninit::new(ptr);
             }
@@ -622,7 +622,7 @@ impl<K: Key, V> DenseSlotMap<K, V> {
         for k in &keys[..i] {
             let idx = k.data().idx.as_usize();
             unsafe {
-                self.slots.get_unchecked_mut(idx).version ^= UInt::ONE;
+                self.slots.get_unchecked_mut(idx).version ^= UnsignedInt::ONE;
             }
         }
 
@@ -1127,7 +1127,7 @@ mod serialize {
             D: Deserializer<'de>,
         {
             let serde_slots: Vec<SerdeSlot<V, K::Version>> = Deserialize::deserialize(deserializer)?;
-            if serde_slots.len() >= <<K as Key>::Index as UInt>::MAX.as_usize() {
+            if serde_slots.len() >= <<K as Key>::Index as UnsignedInt>::MAX.as_usize() {
                 return Err(de::Error::custom(&"too many slots"));
             }
 
@@ -1141,8 +1141,8 @@ mod serialize {
             let mut values = Vec::new();
             let mut slots = Vec::new();
             slots.push(Slot {
-                idx_or_free: UInt::ZERO,
-                version: UInt::ZERO,
+                idx_or_free: UnsignedInt::ZERO,
+                version: UnsignedInt::ZERO,
             });
 
             let mut next_free = serde_slots.len();

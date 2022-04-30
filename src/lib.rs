@@ -344,9 +344,9 @@ pub unsafe trait Key:
     + core::hash::Hash
     + core::fmt::Debug
 {
-    /// Index type
+    /// The Key's Index type
     type Index: KeyIndex;
-    /// Version type
+    /// The Key's Version type
     type Version: KeyVersion;
 
     /// Creates a new key that is always invalid and distinct from any non-null
@@ -404,22 +404,27 @@ pub unsafe trait Key:
     fn data(&self) -> KeyData<Self::Index, Self::Version>;
 }
 
-// All the ops needed for implementing.
-#[doc(hidden)]
+/// An integer that is known not to equal zero.
 pub trait NonZero<Primitive>:
     Sized + Copy + Clone + core::fmt::Debug + core::fmt::Display + PartialEq
 {
+    /// Creates a non-zero without checking whether the value is non-zero. This results in undefined behaviour if the value is zero.
     unsafe fn new_unchecked(n: Primitive) -> Self;
+    /// Creates a non-zero if the given value is not zero.
     fn new(n: Primitive) -> Option<Self>;
+    /// Returns the value as a primitive type.
     fn get(self) -> Primitive;
 }
 
-#[doc(hidden)]
+/// A Type that has a corresponding NonZero Type
 pub trait NonZeroable: Sized {
+    /// Corresponding NonZero Type
     type NonZero: NonZero<Self>;
+    /// Creates a non-zero without checking whether the value is non-zero. This results in undefined behaviour if the value is zero.
     unsafe fn as_nonzero_unchecked(self) -> Self::NonZero {
         Self::NonZero::new_unchecked(self)
     }
+    /// Creates a non-zero if the given value is not zero.
     fn as_nonzero(self) -> Option<Self::NonZero> {
         Self::NonZero::new(self)
     }
@@ -475,8 +480,8 @@ where
     type NonZero = T::NonZero;
 }
 
-#[doc(hidden)]
-pub trait UInt:
+/// Unsigned Primitive Integer
+pub trait UnsignedInt:
     'static
     + Copy
     + Clone
@@ -500,12 +505,17 @@ pub trait UInt:
     + core::ops::Shl<usize, Output = Self>
     + core::ops::Shr<usize, Output = Self>
 {
+    /// The largest value that can be represented 
     const MAX: Self;
 
+    /// 0
     const ZERO: Self;
+    /// 1
     const ONE: Self;
+    /// 2
     const TWO: Self;
 
+    /// Is this an odd integer?
     fn is_odd(self) -> bool {
         self % Self::TWO == Self::ONE
     }
@@ -514,7 +524,7 @@ pub trait UInt:
 macro_rules! _impl_uint_helper {
     ($($uint:ident),*) => {
         $(
-            impl UInt for $uint {
+            impl UnsignedInt for $uint {
                 const MAX: Self = core::$uint::MAX;
                 const ZERO: Self = 0;
                 const ONE: Self = 1;
@@ -526,7 +536,7 @@ macro_rules! _impl_uint_helper {
 
 _impl_uint_helper! { u8, u16, u32, u64, u128, usize }
 
-impl<U: UInt> UInt for Wrapping<U>
+impl<U: UnsignedInt> UnsignedInt for Wrapping<U>
 where
     Self: core::ops::Add<Output = Self>
         + core::ops::AddAssign
@@ -548,11 +558,14 @@ where
     const TWO: Self = Wrapping(U::TWO);
 }
 
-#[doc(hidden)]
+/// Pack two smaller integers into a larger one without any undefined bits
 pub trait Pack<Rhs=Self>: Sized {
+    /// Larger integer type
     type Packed;
 
+    /// packing operation
     fn pack(self, lower: Rhs) -> Self::Packed;
+    /// unpacking operation
     fn unpack(packed: Self::Packed) -> (Self, Rhs);
 }
 
@@ -630,19 +643,25 @@ pub trait SerdeTraitAliasHelper {}
 #[cfg(not(feature = "serde"))]
 impl<T> SerdeTraitAliasHelper for T {}
 
-#[doc(hidden)]
-pub trait KeyIndex: UInt + SerdeTraitAliasHelper {
+/// A type that can index a SlotMap
+pub trait KeyIndex: UnsignedInt + SerdeTraitAliasHelper {
+    /// convert a usize to Self with external checking
     fn from_usize(u: usize) -> Self;
+    /// convert Self to a usize with external checking
     fn as_usize(self) -> usize;
 }
 
-#[doc(hidden)]
-pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable {
+/// A type that represents the generation version of a slot in a SlotMap
+pub trait KeyVersion: UnsignedInt + SerdeTraitAliasHelper + NonZeroable {
     #[doc(hidden)]
     fn new_and_odd(self) -> Self::NonZero {
         unsafe { Self::NonZero::new_unchecked(self | Self::ONE) }
     }
 
+    /// Increment and wrap the version if we hit the max
+    /// 
+    /// WARNING: In the future the default will change to saturating, unless using a Wrapping<_> type,
+    /// and upon hitting max, the slot will be retired
     fn wrapping_increment(self) -> Self;
     /// Returns if `self` is an older version than `rhs`, taking into account wrapping of
     /// versions.
@@ -651,7 +670,7 @@ pub trait KeyVersion: UInt + SerdeTraitAliasHelper + NonZeroable {
 
 impl<V: KeyVersion> KeyVersion for Wrapping<V>
 where
-    Wrapping<V>: UInt,
+    Wrapping<V>: UnsignedInt,
     <V as NonZeroable>::NonZero: NonZero<Wrapping<V>>,
 {
     fn wrapping_increment(self) -> Self {
@@ -842,11 +861,11 @@ mod serialize {
             let mut ser_key: SerKey<I, V> = Deserialize::deserialize(deserializer)?;
 
             // Ensure a.is_null() && b.is_null() implies a == b.
-            if ser_key.idx == UInt::MAX {
-                ser_key.version = UInt::ONE;
+            if ser_key.idx == UnsignedInt::MAX {
+                ser_key.version = UnsignedInt::ONE;
             }
 
-            ser_key.version |= UInt::ONE; // Ensure version is odd.
+            ser_key.version |= UnsignedInt::ONE; // Ensure version is odd.
             Ok(Self::new(ser_key.idx, ser_key.version))
         }
     }

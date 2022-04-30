@@ -12,7 +12,7 @@ use std::ops::{Index, IndexMut};
 
 use super::{Key, KeyData};
 use crate::util::UnwrapUnchecked;
-use crate::{KeyVersion, NonZero, UInt};
+use crate::{KeyVersion, NonZero, UnsignedInt};
 
 #[derive(Debug, Clone)]
 struct Slot<T, V: KeyVersion> {
@@ -560,7 +560,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
                     // invalid, since keys always have an odd version. This
                     // gives us a linear time disjointness check.
                     ptrs[i] = MaybeUninit::new(&mut *value);
-                    *version ^= UInt::ONE;
+                    *version ^= UnsignedInt::ONE;
                 },
 
                 _ => break,
@@ -573,7 +573,7 @@ impl<K: Key, V, S: hash::BuildHasher> SparseSecondaryMap<K, V, S> {
         for k in &keys[0..i] {
             match self.slots.get_mut(&k.data().idx) {
                 Some(Slot { version, .. }) => {
-                    *version ^= UInt::ONE;
+                    *version ^= UnsignedInt::ONE;
                 },
                 _ => unsafe { core::hint::unreachable_unchecked() },
             }

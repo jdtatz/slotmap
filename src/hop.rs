@@ -26,7 +26,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
 
 use crate::util::{Never, UnwrapUnchecked};
-use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UInt};
+use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UnsignedInt};
 
 // Metadata to maintain the freelist.
 #[derive(Clone, Copy, Debug)]
@@ -220,17 +220,17 @@ impl<K: Key, V> HopSlotMap<K, V> {
         slots.push(Slot {
             u: SlotUnion {
                 free: FreeListEntry {
-                    next: UInt::ZERO,
-                    prev: UInt::ZERO,
-                    other_end: UInt::ZERO,
+                    next: UnsignedInt::ZERO,
+                    prev: UnsignedInt::ZERO,
+                    other_end: UnsignedInt::ZERO,
                 },
             },
-            version: UInt::ZERO,
+            version: UnsignedInt::ZERO,
         });
 
         Self {
             slots,
-            num_elems: UInt::ZERO,
+            num_elems: UnsignedInt::ZERO,
             _k: PhantomData,
         }
     }
@@ -264,7 +264,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
     /// assert_eq!(sm.is_empty(), true);
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.num_elems == UInt::ZERO
+        self.num_elems == UnsignedInt::ZERO
     }
 
     /// Returns the number of elements the [`HopSlotMap`] can hold without
@@ -424,15 +424,15 @@ impl<K: Key, V> HopSlotMap<K, V> {
         F: FnOnce(K) -> Result<V, E>,
     {
         // In case f panics, we don't make any changes until we have the value.
-        let new_num_elems = self.num_elems + UInt::ONE;
-        if new_num_elems == UInt::MAX {
+        let new_num_elems = self.num_elems + UnsignedInt::ONE;
+        if new_num_elems == UnsignedInt::MAX {
             panic!("HopSlotMap number of elements overflow");
         }
 
         // All unsafe accesses here are safe due to the invariants of the slot
         // map freelist.
         unsafe {
-            let head = self.freelist(UInt::ZERO).next;
+            let head = self.freelist(UnsignedInt::ZERO).next;
 
             // We have a contiguous block of vacant slots starting at head.
             // Put our new element at the back slot.
@@ -442,7 +442,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
 
             // Freelist is empty.
             if slot_idx == 0 {
-                let version = UInt::ONE;
+                let version = UnsignedInt::ONE;
                 let key = KeyData::new(KeyIndex::from_usize(self.slots.len()), version).into();
 
                 self.slots.push(Slot {
@@ -456,7 +456,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
             }
 
             // Compute value first in case f panics or returns an error.
-            let occupied_version = self.slots[slot_idx].version | UInt::ONE;
+            let occupied_version = self.slots[slot_idx].version | UnsignedInt::ONE;
             let key = KeyData::new(KeyIndex::from_usize(slot_idx), occupied_version).into();
             let value = f(key)?;
 
@@ -464,11 +464,11 @@ impl<K: Key, V> HopSlotMap<K, V> {
             if front == back {
                 // Used last slot in this block, move next one to head.
                 let new_head = self.freelist(front).next;
-                self.freelist(UInt::ZERO).next = new_head;
-                self.freelist(new_head).prev = UInt::ZERO;
+                self.freelist(UnsignedInt::ZERO).next = new_head;
+                self.freelist(new_head).prev = UnsignedInt::ZERO;
             } else {
                 // Continue using this block, only need to update other_ends.
-                let new_back = back - UInt::ONE;
+                let new_back = back - UnsignedInt::ONE;
                 self.freelist(new_back).other_end = front;
                 self.freelist(front).other_end = new_back;
             }
@@ -503,19 +503,19 @@ impl<K: Key, V> HopSlotMap<K, V> {
         match (left_vacant, right_vacant) {
             (false, false) => {
                 // New block, insert it at the tail.
-                let old_tail = self.freelist(UInt::ZERO).prev;
-                self.freelist(UInt::ZERO).prev = i;
+                let old_tail = self.freelist(UnsignedInt::ZERO).prev;
+                self.freelist(UnsignedInt::ZERO).prev = i;
                 self.freelist(old_tail).next = i;
                 *self.freelist(i) = FreeListEntry {
                     other_end: i,
-                    next: UInt::ZERO,
+                    next: UnsignedInt::ZERO,
                     prev: old_tail,
                 };
             },
 
             (false, true) => {
                 // Prepend to vacant block on right.
-                let front_data = *self.freelist(i + UInt::ONE);
+                let front_data = *self.freelist(i + UnsignedInt::ONE);
 
                 // Since the start of this block moved we must update the pointers to it.
                 self.freelist(front_data.other_end).other_end = i;
@@ -526,7 +526,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
 
             (true, false) => {
                 // Append to vacant block on left.
-                let front = self.freelist(i - UInt::ONE).other_end;
+                let front = self.freelist(i - UnsignedInt::ONE).other_end;
                 self.freelist(i).other_end = front;
                 self.freelist(front).other_end = i;
             },
@@ -534,19 +534,19 @@ impl<K: Key, V> HopSlotMap<K, V> {
             (true, true) => {
                 // We must merge left and right.
                 // First snip right out of the freelist.
-                let right = *self.freelist(i + UInt::ONE);
+                let right = *self.freelist(i + UnsignedInt::ONE);
                 self.freelist(right.prev).next = right.next;
                 self.freelist(right.next).prev = right.prev;
 
                 // Now update endpoints.
-                let front = self.freelist(i - UInt::ONE).other_end;
+                let front = self.freelist(i - UnsignedInt::ONE).other_end;
                 let back = right.other_end;
                 self.freelist(front).other_end = back;
                 self.freelist(back).other_end = front;
             },
         }
 
-        self.num_elems -= UInt::ONE;
+        self.num_elems -= UnsignedInt::ONE;
 
         value
     }
@@ -803,7 +803,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
             // This gives us a linear time disjointness check.
             unsafe {
                 let slot = self.slots.get_unchecked_mut(kd.idx.as_usize());
-                slot.version ^= UInt::ONE;
+                slot.version ^= UnsignedInt::ONE;
                 ptrs[i] = MaybeUninit::new(&mut *slot.u.value);
             }
             i += 1;
@@ -813,7 +813,7 @@ impl<K: Key, V> HopSlotMap<K, V> {
         for k in &keys[..i] {
             let idx = k.data().idx.as_usize();
             unsafe {
-                self.slots.get_unchecked_mut(idx).version ^= UInt::ONE;
+                self.slots.get_unchecked_mut(idx).version ^= UnsignedInt::ONE;
             }
         }
 
@@ -1176,7 +1176,7 @@ impl<K: Key, V> Iterator for IntoIter<K, V> {
         self.num_left -= 1;
         let slot = &mut self.slots[idx];
         let key = KeyData::new(KeyIndex::from_usize(idx), slot.version).into();
-        slot.version = UInt::ZERO; // Prevent dropping after extracting the value.
+        slot.version = UnsignedInt::ZERO; // Prevent dropping after extracting the value.
         Some((key, unsafe { ManuallyDrop::take(&mut slot.u.value) }))
     }
 
@@ -1385,9 +1385,9 @@ mod serialize {
                     },
                     None => SlotUnion {
                         free: FreeListEntry {
-                            next: UInt::ZERO,
-                            prev: UInt::ZERO,
-                            other_end: UInt::ZERO,
+                            next: UnsignedInt::ZERO,
+                            prev: UnsignedInt::ZERO,
+                            other_end: UnsignedInt::ZERO,
                         },
                     },
                 },
@@ -1411,7 +1411,7 @@ mod serialize {
             D: Deserializer<'de>,
         {
             let mut slots: Vec<Slot<V, K::Index, K::Version>> = Deserialize::deserialize(deserializer)?;
-            if slots.len() >= <<K as Key>::Index as UInt>::MAX.as_usize() {
+            if slots.len() >= <<K as Key>::Index as UnsignedInt>::MAX.as_usize() {
                 return Err(de::Error::custom(&"too many slots"));
             }
 
@@ -1421,13 +1421,13 @@ mod serialize {
             }
 
             slots[0].u.free = FreeListEntry {
-                next: UInt::ZERO,
-                prev: UInt::ZERO,
-                other_end: UInt::ZERO,
+                next: UnsignedInt::ZERO,
+                prev: UnsignedInt::ZERO,
+                other_end: UnsignedInt::ZERO,
             };
 
             // We have our slots, rebuild freelist.
-            let mut num_elems = UInt::ZERO;
+            let mut num_elems = UnsignedInt::ZERO;
             let mut prev = 0;
             let mut i = 0;
             while i < slots.len() {
@@ -1443,7 +1443,7 @@ mod serialize {
                     slots[back].u.free.other_end = KeyIndex::from_usize(front);
                     slots[prev].u.free.next = KeyIndex::from_usize(front);
                     slots[front].u.free = FreeListEntry {
-                        next: UInt::ZERO,
+                        next: UnsignedInt::ZERO,
                         prev: KeyIndex::from_usize(prev),
                         other_end: KeyIndex::from_usize(back),
                     };
@@ -1453,7 +1453,7 @@ mod serialize {
 
                 // Skip occupied slots.
                 while i < slots.len() && slots[i].occupied() {
-                    num_elems += UInt::ONE;
+                    num_elems += UnsignedInt::ONE;
                     i += 1;
                 }
             }

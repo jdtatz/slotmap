@@ -12,7 +12,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
 
 use super::{Key, KeyData};
-use crate::{KeyIndex, KeyVersion, NonZero, UInt};
+use crate::{KeyIndex, KeyVersion, NonZero, UnsignedInt};
 
 // This representation works because we don't have to store the versions
 // of removed elements.
@@ -50,7 +50,7 @@ impl<T, V: KeyVersion> Slot<T, V> {
     pub fn version(&self) -> V {
         match self {
             Occupied { version, .. } => version.get(),
-            Vacant => UInt::ZERO,
+            Vacant => UnsignedInt::ZERO,
         }
     }
 
@@ -601,7 +601,7 @@ impl<K: Key, V> SecondaryMap<K, V> {
                     // gives us a linear time disjointness check.
                     ptrs[i] = MaybeUninit::new(&mut *value);
                     slot_versions[i] = MaybeUninit::new(version.get());
-                    *version = NonZero::new(UInt::TWO).unwrap();
+                    *version = NonZero::new(UnsignedInt::TWO).unwrap();
                 },
 
                 _ => break,
@@ -1614,7 +1614,7 @@ mod serialize {
             D: Deserializer<'de>,
         {
             let mut slots: Vec<Slot<V, K::Version>> = Deserialize::deserialize(deserializer)?;
-            if slots.len() >= (<<K as Key>::Index as UInt>::MAX - UInt::ONE).as_usize() {
+            if slots.len() >= (<<K as Key>::Index as UnsignedInt>::MAX - UnsignedInt::ONE).as_usize() {
                 return Err(de::Error::custom(&"too many slots"));
             }
 

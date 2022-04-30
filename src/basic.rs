@@ -14,7 +14,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Index, IndexMut};
 
 use crate::util::{Never, UnwrapUnchecked};
-use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UInt};
+use crate::{DefaultKey, Key, KeyData, KeyIndex, KeyVersion, NonZero, UnsignedInt};
 
 // Storage inside a slot or metadata for the freelist when vacant.
 union SlotUnion<T, I: KeyIndex> {
@@ -205,15 +205,15 @@ impl<K: Key, V> SlotMap<K, V> {
         let mut slots = Vec::with_capacity(capacity + 1);
         slots.push(Slot {
             u: SlotUnion {
-                next_free: UInt::ZERO,
+                next_free: UnsignedInt::ZERO,
             },
-            version: UInt::ZERO,
+            version: UnsignedInt::ZERO,
         });
 
         Self {
             slots,
-            free_head: UInt::ONE,
-            num_elems: UInt::ZERO,
+            free_head: UnsignedInt::ONE,
+            num_elems: UnsignedInt::ZERO,
             _k: PhantomData,
         }
     }
@@ -247,7 +247,7 @@ impl<K: Key, V> SlotMap<K, V> {
     /// assert_eq!(sm.is_empty(), true);
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.num_elems == UInt::ZERO
+        self.num_elems == UnsignedInt::ZERO
     }
 
     /// Returns the number of elements the [`SlotMap`] can hold without
@@ -400,13 +400,13 @@ impl<K: Key, V> SlotMap<K, V> {
         F: FnOnce(K) -> Result<V, E>,
     {
         // In case f panics, we don't make any changes until we have the value.
-        let new_num_elems = self.num_elems + UInt::ONE;
-        if new_num_elems == UInt::MAX {
+        let new_num_elems = self.num_elems + UnsignedInt::ONE;
+        if new_num_elems == UnsignedInt::MAX {
             panic!("SlotMap number of elements overflow");
         }
 
         if let Some(slot) = self.slots.get_mut(self.free_head.as_usize()) {
-            let occupied_version = slot.version | UInt::ONE;
+            let occupied_version = slot.version | UnsignedInt::ONE;
             let kd = KeyData::new(self.free_head, occupied_version);
 
             // Get value first in case f panics or returns an error.
@@ -422,7 +422,7 @@ impl<K: Key, V> SlotMap<K, V> {
             return Ok(kd.into());
         }
 
-        let version = UInt::ONE;
+        let version = UnsignedInt::ONE;
         let kd = KeyData::new(KeyIndex::from_usize(self.slots.len()), version);
 
         // Create new slot before adjusting freelist in case f or the allocation panics or errors.
@@ -433,7 +433,7 @@ impl<K: Key, V> SlotMap<K, V> {
             version,
         });
 
-        self.free_head = kd.idx + UInt::ONE;
+        self.free_head = kd.idx + UnsignedInt::ONE;
         self.num_elems = new_num_elems;
         Ok(kd.into())
     }
@@ -449,7 +449,7 @@ impl<K: Key, V> SlotMap<K, V> {
         // Maintain freelist.
         slot.u.next_free = self.free_head;
         self.free_head = KeyIndex::from_usize(idx);
-        self.num_elems -= UInt::ONE;
+        self.num_elems -= UnsignedInt::ONE;
         slot.version = slot.version.wrapping_increment();
 
         value
@@ -700,7 +700,7 @@ impl<K: Key, V> SlotMap<K, V> {
             // This gives us a linear time disjointness check.
             unsafe {
                 let slot = self.slots.get_unchecked_mut(kd.idx.as_usize());
-                slot.version ^= UInt::ONE;
+                slot.version ^= UnsignedInt::ONE;
                 ptrs[i] = MaybeUninit::new(&mut *slot.u.value);
             }
             i += 1;
@@ -710,7 +710,7 @@ impl<K: Key, V> SlotMap<K, V> {
         for k in &keys[..i] {
             let idx = k.data().idx.as_usize();
             unsafe {
-                self.slots.get_unchecked_mut(idx).version ^= UInt::ONE;
+                self.slots.get_unchecked_mut(idx).version ^= UnsignedInt::ONE;
             }
         }
 
@@ -1073,7 +1073,7 @@ impl<K: Key, V> Iterator for IntoIter<K, V> {
                 let kd = KeyData::new(KeyIndex::from_usize(idx), slot.version);
 
                 // Prevent dropping after extracting the value.
-                slot.version = UInt::ZERO;
+                slot.version = UnsignedInt::ZERO;
 
                 // This is safe because we know the slot was occupied.
                 let value = unsafe { ManuallyDrop::take(&mut slot.u.value) };
@@ -1267,7 +1267,7 @@ mod serialize {
                         value: ManuallyDrop::new(value),
                     },
                     None => SlotUnion {
-                        next_free: UInt::ZERO,
+                        next_free: UnsignedInt::ZERO,
                     },
                 },
                 version: serde_slot.version,
@@ -1294,7 +1294,7 @@ mod serialize {
             D: Deserializer<'de>,
         {
             let mut slots: Vec<Slot<V, <K as Key>::Index, <K as Key>::Version>> = Deserialize::deserialize(deserializer)?;
-            if slots.len() >= <<K as Key>::Index as UInt>::MAX.as_usize() {
+            if slots.len() >= <<K as Key>::Index as UnsignedInt>::MAX.as_usize() {
                 return Err(de::Error::custom(&"too many slots"));
             }
 
@@ -1303,15 +1303,15 @@ mod serialize {
                 return Err(de::Error::custom(&"first slot not empty"));
             }
 
-            slots[0].version = UInt::ZERO;
-            slots[0].u.next_free = UInt::ZERO;
+            slots[0].version = UnsignedInt::ZERO;
+            slots[0].u.next_free = UnsignedInt::ZERO;
 
             // We have our slots, rebuild freelist.
-            let mut num_elems = UInt::ZERO;
+            let mut num_elems = UnsignedInt::ZERO;
             let mut next_free = KeyIndex::from_usize(slots.len());
             for (i, slot) in slots[1..].iter_mut().enumerate() {
                 if slot.occupied() {
-                    num_elems += UInt::ONE;
+                    num_elems += UnsignedInt::ONE;
                 } else {
                     slot.u.next_free = next_free;
                     next_free = KeyIndex::from_usize(i + 1);
